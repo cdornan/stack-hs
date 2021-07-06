@@ -10,6 +10,8 @@
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TupleSections #-}
 
 module Stack.Setup
   ( setupEnv
@@ -34,7 +36,9 @@ import              Control.Applicative (empty)
 import "cryptonite" Crypto.Hash (SHA1(..), SHA256(..))
 import              Pantry.Internal.AesonExtended
 import qualified    Data.ByteString as S
+import qualified    Data.ByteString.Char8 as SC
 import qualified    Data.ByteString.Lazy as LBS
+import              Data.Char
 import qualified    Data.Conduit.Binary as CB
 import              Data.Conduit.Lazy (lazyConsume)
 import qualified    Data.Conduit.List as CL
@@ -49,6 +53,7 @@ import qualified    Data.Text as T
 import qualified    Data.Text.Encoding as T
 import qualified    Data.Text.Encoding.Error as T
 import qualified    Data.Yaml as Yaml
+import              Distribution.Pretty(prettyShow)
 import              Distribution.System (OS, Arch (..), Platform (..))
 import qualified    Distribution.System as Cabal
 import              Distribution.Text (simpleParse)
@@ -643,6 +648,38 @@ ensureSandboxedCompiler
   -> Memoized SetupInfo
   -> RIO env (CompilerPaths, ExtraDirs)
 ensureSandboxedCompiler sopts getSetupInfo' = do
+  maybe (ensureSandboxedCompiler_ sopts getSetupInfo') return
+      =<< hsDiscoverCompiler sopts getSetupInfo'
+
+hsDiscoverCompiler
+  :: forall env . HasBuildConfig env
+  => SetupOpts
+  -> Memoized SetupInfo
+  -> RIO env (Maybe (CompilerPaths, ExtraDirs))
+hsDiscoverCompiler sopts _ = do
+    case soptsWantedCompiler sopts of
+      WCGhc vrn -> hs vrn
+      _ -> return Nothing
+  where
+    hs :: Version -> RIO env (Maybe (CompilerPaths, ExtraDirs))
+    hs vrn = do
+      (ec,bs) <- proc "hs" ["whereis","ghc-"++prettyShow vrn] readProcessStdout
+      root <- parseAbsDir $ T.unpack $ T.decodeUtf8With T.lenientDecode $ SC.dropWhileEnd isSpace $ LBS.toStrict bs
+      let bin = root </> [reldir|bin|]
+          exe = bin  </> [relfile|ghc|]
+          ed  = mempty { edBins = [bin] }
+      case ec of
+        ExitSuccess   -> Just . (,ed) <$> pathsFromCompiler Ghc CompilerBuildStandard True exe
+        ExitFailure _ -> do
+          logWarn "hs failed: reverting to normal toolchain discovery"
+          return Nothing
+
+ensureSandboxedCompiler_
+  :: HasBuildConfig env
+  => SetupOpts
+  -> Memoized SetupInfo
+  -> RIO env (CompilerPaths, ExtraDirs)
+ensureSandboxedCompiler_ sopts getSetupInfo' = do
     let wanted = soptsWantedCompiler sopts
     -- List installed tools
     config <- view configL
